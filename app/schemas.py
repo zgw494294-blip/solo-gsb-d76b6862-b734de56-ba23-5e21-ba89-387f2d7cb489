@@ -73,6 +73,89 @@ class SolveResponse(BaseModel):
     message: str = ""
 
 
+# ---------------- 调光路径规划 ----------------
+
+
+class PlanPathRequest(BaseModel):
+    channels: list[ChannelInput] = Field(..., description="3～6 路 LED，ID 唯一")
+    start_drives: list[int] = Field(
+        ..., description="各路起始驱动级 0～255，顺序与 channels 一致"
+    )
+    target_r: int = Field(..., ge=0, le=1000)
+    target_g: int = Field(..., ge=0, le=1000)
+    target_b: int = Field(..., ge=0, le=1000)
+    steps: int = Field(..., ge=2, le=5, description="等时步骤数 2～5")
+    max_delta: int = Field(
+        ..., ge=1, le=255, description="统一的每步每路驱动变化上限 1～255"
+    )
+    tolerance: int = Field(..., ge=0, le=20, description="共用整数容差")
+
+    @field_validator("start_drives")
+    @classmethod
+    def _check_drives(cls, v: list[int]) -> list[int]:
+        if any(not isinstance(d, int) or not 0 <= d <= 255 for d in v):
+            raise ValueError("每个起始驱动级必须是 0～255 的整数")
+        return v
+
+    @model_validator(mode="after")
+    def _check(self) -> "PlanPathRequest":
+        if not 3 <= len(self.channels) <= 6:
+            raise ValueError("LED 通道数必须为 3～6 路")
+        ids = [c.id for c in self.channels]
+        if len(set(ids)) != len(ids):
+            dup = sorted({x for x in ids if ids.count(x) > 1})
+            raise ValueError(f"通道 ID 必须唯一，重复 ID：{', '.join(dup)}")
+        if len(self.start_drives) != len(self.channels):
+            raise ValueError(
+                f"起始驱动级数量（{len(self.start_drives)}）必须与通道数"
+                f"（{len(self.channels)}）一致"
+            )
+        return self
+
+
+class PathStepChannel(BaseModel):
+    id: str
+    drive: int = Field(..., ge=0, le=255)
+    # 与前一步（首步与起点）的驱动级差值，绝对值不超过上限
+    delta: int
+
+
+class PathStepResult(BaseModel):
+    index: int = Field(..., ge=1, le=5, description="1 基步骤号")
+    channels: list[PathStepChannel]
+    actual_rgb: list[float]
+    reference_rgb: list[float]
+    # 实际色 − 参考色（逐分量）
+    errors: list[float]
+    in_range: list[bool]
+    power_mw: float
+    power_num: int = Field(..., description="该步功率的整数分子，功率 = /255")
+
+
+class PlanPathResponse(BaseModel):
+    # optimal：已证明各步功率之和最小（steps 有值）；
+    # infeasible：已证明无完整路径（steps 为空）；
+    # unknown：搜索未完成、未证明最优（steps 为空）
+    status: Literal["optimal", "infeasible", "unknown"]
+    target: list[int] = []
+    tolerance: int = 0
+    steps: int = 0
+    max_delta: int = 0
+    # 与入参同序的起始驱动级
+    start_drives: list[int] = []
+    # 起点实际色（未裁剪公式）
+    start_actual_rgb: list[float] = []
+    steps_result: list[PathStepResult] = []
+    sorted_ids: list[str] = []
+    # 字典序 tie-break 是否完整跑完（False 时功率仍最优，仅序列未规定）
+    tiebreak_complete: bool = True
+    total_power_mw: float | None = None
+    power_num: int | None = Field(
+        default=None, description="各步功率之和的整数分子，实际 = /255"
+    )
+    message: str = ""
+
+
 # ---------------- 满档读数标定 ----------------
 
 

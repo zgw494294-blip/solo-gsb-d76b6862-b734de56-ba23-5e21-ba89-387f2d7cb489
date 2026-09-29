@@ -65,9 +65,68 @@
     </div>
   </section>
 
+  <section class="panel" id="path-panel">
+    <h2>③ 调光路径规划（从当前驱动级等时过渡到目标色）</h2>
+    <p class="hint">
+      各路填写 <strong>0～255</strong> 整数起始驱动级（起点实际色按
+      Σ(满档读数×驱动级)÷255 的<strong>未裁剪</strong>公式计算）；目标色与容差沿用 ② 的录入。
+      等时步骤数 <strong>2～5</strong>，每步每路驱动变化上限统一为 <strong>1～255</strong>。
+      第 k 步参考色 = 起点实际色到目标色按 k/步骤数的线性插值（不先取整），
+      每步实际 RGB 均须处于参考色 ±容差且在 0～1000 内。后端联合优化
+      <strong>各步功率之和最小</strong>的完整路径；无完整路径时不返回局部步骤，
+      搜索未证明最优时报告“未完成”。
+    </p>
+    <div class="table-scroll">
+      <table class="grid" id="path-start-table">
+        <thead>
+          <tr><th>ID</th><th>起始驱动级 (0～255)</th><th>满档色</th><th>起点实际贡献</th></tr>
+        </thead>
+        <tbody id="path-start-tbody"></tbody>
+      </table>
+    </div>
+    <div class="target-inputs path-params">
+      <label>步骤数 <input type="number" id="path-steps" min="2" max="5" step="1" value="3"></label>
+      <label>每步驱动变化上限 ±<input type="number" id="path-delta" min="1" max="255" step="1" value="80"></label>
+    </div>
+    <div class="solve-row">
+      <button type="button" id="path-btn" class="btn primary">规划最小功率调光路径</button>
+      <span class="solver-meta">全部步骤联合整数规划；起点功率固定不计入优化。通道或路径参数变更后旧结果自动清除。</span>
+    </div>
+
+    <div id="path-result" hidden>
+      <div class="calib-status s-unique" id="path-status"></div>
+
+      <div class="path-timeline-head">
+        <div class="swatch-block">
+          <div class="swatch path-sw" id="path-start-swatch"></div>
+          <div class="swatch-label">起点（步 0）<br><code id="path-start-hex"></code></div>
+        </div>
+        <div class="path-timeline-meta">
+          <div id="path-start-rgb" class="path-rgb-line"></div>
+        </div>
+      </div>
+
+      <div class="path-timeline" id="path-timeline"></div>
+
+      <h3 class="subhead">各步驱动级（按时间）</h3>
+      <div class="table-scroll">
+        <table class="grid" id="path-drive-table">
+          <thead id="path-drive-head"></thead>
+          <tbody id="path-drive-tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="power-line">
+        <span>各步功率之和：<strong id="path-total-power">—</strong> mW</span>
+        <span class="power-frac" id="path-power-frac"></span>
+      </div>
+      <p class="hint" id="path-tiebreak-hint"></p>
+    </div>
+  </section>
+
   <section class="panel" id="calib-panel">
     <div class="panel-head">
-      <h2>③ LED 满档读数标定（3～12 组实测样本反求各路满档 RGB）</h2>
+      <h2>④ LED 满档读数标定（3～12 组实测样本反求各路满档 RGB）</h2>
       <div class="panel-actions">
         <button type="button" id="add-sample" class="btn small">＋ 添加样本</button>
         <button type="button" id="gen-samples" class="btn small ghost">按当前通道生成示例样本</button>
@@ -121,7 +180,7 @@
 
   <section class="panel" id="result-panel" hidden>
     <div class="panel-head">
-      <h2>④ 配方结果与对照</h2>
+      <h2>⑤ 配方结果与对照</h2>
       <div class="panel-actions">
         <button type="button" id="restore-opt" class="btn small ghost" hidden>恢复最优驱动级</button>
       </div>

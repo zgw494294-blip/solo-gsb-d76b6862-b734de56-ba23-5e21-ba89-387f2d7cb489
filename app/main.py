@@ -13,10 +13,15 @@ from .schemas import (
     CalibrateResponse,
     CalibChannelResult,
     ChannelSolution,
+    PathStepChannel,
+    PathStepResult,
+    PlanPathRequest,
+    PlanPathResponse,
     SolveRequest,
     SolveResponse,
 )
 from .calibration import CalibSample, calibrate
+from .path_planner import plan_path
 from .solver import Channel, solve, SolverError
 
 # static/ 与 app/ 同级；用绝对路径，保证从任意工作目录启动都能找到页面
@@ -25,8 +30,11 @@ STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(
     title="LED 混光配方台 API",
-    description="基于 OR-Tools CP-SAT 的多通道 LED 混光最小功率配方求解",
-    version="1.0.0",
+    description=(
+        "基于 OR-Tools CP-SAT 的多通道 LED 混光最小功率配方求解、"
+        "起始驱动级到目标色的最小功率调光路径规划与满档读数标定"
+    ),
+    version="1.1.0",
 )
 
 
@@ -89,6 +97,95 @@ def api_solve(req: SolveRequest) -> SolveResponse:
         power_num=sol.power_num,
         message="求解成功：总功率已最小，相同功率下驱动级序列按 ID 字典序最小。",
     )
+
+
+@app.post("/api/plan_path", response_model=PlanPathResponse)
+def api_plan_path(req: PlanPathRequest) -> PlanPathResponse:
+    """从起始驱动级到目标色规划最小化各步功率之和的完整调光路径。"""
+    channels = [
+        Channel(id=c.id, rgb=(c.r, c.g, c.b), power_mw=c.power_mw)
+        for c in req.channels
+    ]
+    target = (req.target_r, req.target_g, req.target_b)
+    status, sol = plan_path(
+        channels,
+        list(req.start_drives),
+        target,
+        req.steps,
+        req.max_delta,
+        req.tolerance,
+    )
+
+    base = PlanPathResponse(
+        status="unknown",
+        target=list(target),
+        tolerance=req.tolerance,
+        steps=req.steps,
+        max_delta=req.max_delta,
+        start_drives=list(req.start_drives),
+    )
+
+    if status == "infeasible":
+        base.status = "infeasible"
+        base.message = (
+            "无完整调光路径：在给定的步骤数、每步驱动变化上限与容差下，"
+            "不存在一条从起始驱动级出发、每步实际 RGB 都落入对应参考色"
+            "±容差（且 0～1000）的完整路径。未返回任何局部步骤。"
+            "可尝试增加步骤数、放大每步驱动变化上限或放宽容差。"
+        )
+        return base
+
+    if status == "unknown":
+        base.status = "unknown"
+        base.message = (
+            "调光路径搜索未完成：CP-SAT 未能在求解时限内证明最优性，"
+            "按规定不返回任何（可能非最优的）路径步骤。"
+            "请调整参数或稍后重试。"
+        )
+        return base
+
+    assert sol is not None
+    steps_out: list[PathStepResult] = []
+    for k, step in enumerate(sol.steps):
+        prev = req.start_drives if k == 0 else sol.steps[k - 1].drives
+        steps_out.append(
+            PathStepResult(
+                index=step.index,
+                channels=[
+                    PathStepChannel(
+                        id=req.channels[i].id,
+                        drive=step.drives[i],
+                        delta=step.drives[i] - prev[i],
+                    )
+                    for i in range(len(req.channels))
+                ],
+                actual_rgb=step.actual_rgb,
+                reference_rgb=step.reference_rgb,
+                errors=step.errors,
+                in_range=step.in_range,
+                power_mw=step.power_mw,
+                power_num=step.power_num,
+            )
+        )
+
+    base.status = "optimal"
+    base.start_actual_rgb = sol.start_actual_rgb
+    base.steps_result = steps_out
+    base.sorted_ids = sol.sorted_ids
+    base.tiebreak_complete = sol.tiebreak_complete
+    base.total_power_mw = sol.power_mw
+    base.power_num = sol.power_num
+    if sol.tiebreak_complete:
+        base.message = (
+            "路径规划成功：各步功率之和已证明最小；相同总功率下驱动级序列"
+            "（先按时间步、步内按 ID 字典序）取字典序最小。"
+        )
+    else:
+        base.message = (
+            "路径规划成功：各步功率之和已证明最小（字典序 tie-break 未在"
+            "时限内跑完，不影响功率最优性）。"
+        )
+    return base
 
 
 @app.post("/api/calibrate", response_model=CalibrateResponse)

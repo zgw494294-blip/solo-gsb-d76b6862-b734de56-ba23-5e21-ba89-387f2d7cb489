@@ -1,6 +1,7 @@
 # LED 混光配方台（本地）
 
-以 **OR-Tools CP-SAT** 精确求解多通道 LED 混光的**最小总功率**配方；
+以 **OR-Tools CP-SAT** 精确求解多通道 LED 混光的**最小总功率**配方，
+并可规划从一组起始驱动级到目标色的**最小各步功率之和调光路径**；
 **Python / FastAPI** 提供接口，页面为**原生 HTML / CSS / JavaScript**（无前端框架、无构建步骤）。
 
 ## 一条命令启动
@@ -38,7 +39,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 驱动级可直接手动修改，页面会按精确公式实时预览色块/误差/功率，
      “恢复最优驱动级”一键回到最优配方；
    - **无可行解时给出明确提示，不返回任何近似配方。**
-4. **满档读数标定（③）**：不知道各路满档线性 RGB 时，在 3～6 路通道下
+4. **满档读数标定（④）**：不知道各路满档线性 RGB 时，在 3～6 路通道下
    录入 3～12 组实测样本——每组给出各路 `0～255` 整数驱动级与实测
    `0～6000` 整数线性 RGB，点击 **“反求满档读数”**：
    - 实测值按 `实际值 = Σ(满档读数 × 驱动级) / 255` 后**四舍五入到整数**解释，
@@ -50,6 +51,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - “按当前通道生成示例样本”可依据当前通道表的满档值合成每路单独
      满档点亮的示例；非法样本（越界、数量不符、ID 问题等）前端与
      接口都会明确拒绝（HTTP 422）。
+5. **调光路径规划（③）**：在现有通道表上录入各路 `0～255` 整数
+   **起始驱动级**，沿用 ② 的目标色与 `0～20` 整数容差，再给
+   `2～5` 个**等时步骤**与统一的**每步驱动变化上限**（`1～255`），
+   点击 **“规划最小功率调光路径”**：
+   - 起点实际色按未裁剪公式 `Σ(满档读数×起始驱动级)/255` 计算；
+     第 k 步参考色为起点实际色到目标色按 `k/步骤数` 的线性插值，**不先取整**；
+   - 每步实际 RGB 均须处于对应参考色 **±容差**（含端点）且在 `0～1000` 内，
+     每路驱动级为 `0～255` 整数且与前一步（首步与起点）相差不超过上限；
+   - CP-SAT 联合优化**各步功率之和最小**的完整路径，按时间展示
+     各步驱动级（含 Δ）、实际 RGB、参考色误差与该步功率；
+   - **无完整路径时不返回任何局部步骤**；搜索未证明最优时明确报告
+     “搜索未完成”，同样不返回步骤；
+   - 通道表或目标/容差/步骤数/变化上限等任一参数变更后，旧路径结果自动清除。
 
 ## 数学模型
 
@@ -84,6 +98,55 @@ CP-SAT 分两阶段精确求解（见 `app/solver.py`）：
 
 模型判定为不可行时，接口返回 `feasible: false` 且不带任何配方；
 仅当 CP-SAT 确认最优（OPTIMAL）时才返回方案。
+
+### 调光路径的整数模型
+
+各路起始驱动级 ``start[i]`` 为给定整数，起点实际色分子（未裁剪、不取整）：
+
+```text
+num0[c] = Σ_i reading[i][c] · start[i]
+```
+
+第 k 步（k = 1…K）参考色为起点实际色 `num0/(255)` 与目标色 target 按
+`k/K` 的线性插值。其分子为整数（分母 `255·K`）：
+
+```text
+L[k][c] = (K − k)·num0[c] + k·255·target[c]
+ref_k,c = L[k][c] / (255·K)          # 不先取整
+```
+
+决策变量为每步各路驱动级 `d[k][i] ∈ [0,255]`，令
+`s[k][c] = Σ_i reading[i][c]·d[k][i]`，则实际色为 `s[k][c]/255`。
+约束全部乘上分母写成整数线性式（无浮点变量）：
+
+```text
+# 每步每路与前一步（首步与起点）相差不超过 Δ
+|d[k][i] − d[k−1][i]| ≤ Δ，  d[0][i] = start[i]
+
+# 实际色处于参考色 ±容差（实际−参考 = (K·s − L)/(255·K)）
+L[k][c] − 255·K·tol ≤ K·s[k][c] ≤ L[k][c] + 255·K·tol
+
+# 实际色处于 0～1000（不裁剪，只约束）
+0 ≤ s[k][c] ≤ 255·1000
+```
+
+目标为**各步功率之和**（起点功率固定、不计入）：
+
+```text
+minimize  Σ_k Σ_i power_i · d[k][i]      # 实际和 = /255 mW
+```
+
+全部 K 步在**同一个 CP-SAT 模型**中联合优化，保证全路径功率和全局最小。
+结论三态（见 `app/path_planner.py`）：
+
+1. 仅当 CP-SAT 确认最优（OPTIMAL）才返回完整 K 步；
+2. 判定不可行（INFEASIBLE）→ `infeasible`，**不返回任何局部步骤**；
+3. 超时未证明最优也未证伪 → `unknown`（搜索未完成），同样不返回步骤。
+
+确认功率最优后，再以「先按时间步、步内按 ID 字符串升序」展平的驱动级
+序列做字典序最小化（顺序固定法逐变量求解，≤5·6=30 次小规模求解），
+使结果确定可复现；该 tie-break 不影响功率最优性，即便未跑完也仍返回
+功率最优路径（`tiebreak_complete: false`）。
 
 ### 满档读数标定的整数模型
 
@@ -136,6 +199,72 @@ CP-SAT 两次求解给出**可证明**的三态结论（见 `app/calibration.py`
 `sorted_ids`（字典序 tie-break 实际使用的 ID 顺序）、`actual_rgb`、`errors`、
 `in_range`、`total_power_mw`、`power_num`（总功率的整数分子，实际功率
 `power_num / 255`）。录入不合法返回 HTTP 422 并附字段级错误信息。
+
+### `POST /api/plan_path`
+
+在现有通道（同 `/api/solve` 的通道字段）上，给出各路起始驱动级、
+`2～5` 步、统一每步驱动变化上限与共用容差，联合求解最小各步功率和的
+完整路径：
+
+```bash
+curl -s http://localhost:8000/api/plan_path -H 'Content-Type: application/json' -d '{
+  "channels": [
+    {"id": "R", "r": 1000, "g": 120, "b": 40,  "power_mw": 3200},
+    {"id": "G", "r": 160,  "g": 1000, "b": 90, "power_mw": 2800},
+    {"id": "B", "r": 60,   "g": 80,  "b": 1000, "power_mw": 3400}
+  ],
+  "start_drives": [0, 0, 0],
+  "target_r": 300, "target_g": 250, "target_b": 200,
+  "steps": 3, "max_delta": 128, "tolerance": 20
+}'
+```
+
+成功时响应（节选；`steps_result` 按时间顺序，每步含各路驱动级与相对上一步
+的 `delta`、实际/参考 RGB、参考色误差 `errors`、`in_range` 与该步功率，
+顶层 `power_num` 为各步功率之和的分子，实际 = `/255 mW`）：
+
+```json
+{
+  "status": "optimal",
+  "target": [300, 250, 200],
+  "tolerance": 20,
+  "steps": 3,
+  "max_delta": 128,
+  "start_drives": [0, 0, 0],
+  "start_actual_rgb": [0.0, 0.0, 0.0],
+  "steps_result": [
+    {
+      "index": 1,
+      "channels": [
+        {"id": "R", "drive": 18, "delta": 18},
+        {"id": "G", "drive": 14, "delta": 14},
+        {"id": "B", "drive": 10, "delta": 10}
+      ],
+      "actual_rgb": [81.73, 66.51, 46.98],
+      "reference_rgb": [100.0, 83.33, 66.67],
+      "errors": [-18.27, -16.82, -19.69],
+      "in_range": [true, true, true],
+      "power_mw": 512.94,
+      "power_num": 130800
+    }
+  ],
+  "sorted_ids": ["B", "G", "R"],
+  "tiebreak_complete": true,
+  "total_power_mw": 3534.12,
+  "power_num": 901200
+}
+```
+
+`status` 三态：
+
+| status       | 含义                                         | `steps_result` |
+| ------------ | -------------------------------------------- | -------------- |
+| `optimal`    | 已证明各步功率之和最小，返回完整路径         | 有值           |
+| `infeasible` | 已证明无完整路径，**不返回任何局部步骤**     | 空             |
+| `unknown`    | 搜索未完成、未证明最优，不返回步骤           | 空             |
+
+通道数非 3～6、ID 为空/重复、起始驱动级非 `0～255` 整数或数量与通道不符、
+步骤数非 `2～5`、变化上限非 `1～255`、容差非 `0～20` 等，一律 HTTP 422。
 
 ### `POST /api/calibrate`
 
@@ -191,19 +320,21 @@ curl -s http://localhost:8000/api/calibrate -H 'Content-Type: application/json' 
 
 ```text
 app/
-  main.py        # FastAPI 应用与 /api/solve、/api/calibrate、静态页面挂载
-  solver.py      # CP-SAT 两阶段精确求解（配方）
-  calibration.py # CP-SAT 满档读数反求（唯一/矛盾/不唯一/搜索未完成 四态）
-  schemas.py     # 请求/响应模型与录入校验
+  main.py         # FastAPI 应用与 /api/solve、/api/plan_path、/api/calibrate、静态页面挂载
+  solver.py       # CP-SAT 两阶段精确求解（配方）
+  path_planner.py # CP-SAT 调光路径联合求解（最优/无完整路径/搜索未完成 三态）
+  calibration.py  # CP-SAT 满档读数反求（唯一/矛盾/不唯一/搜索未完成 四态）
+  schemas.py      # 请求/响应模型与录入校验
 static/
   index.html   # 页面结构
   style.css    # 样式
-  app.js       # 通道编辑、标定样本、求解调用、色块/误差/功率计算与手动预览
+  app.js       # 通道编辑、路径规划、标定样本、求解调用、色块/误差/功率计算与手动预览
 Dockerfile
 docker-compose.yml
 requirements.txt
-test_solver.py       # 求解器冒烟测试（含 3 路穷举对照，可直接 python3 运行）
-test_calibration.py  # 标定四态、穷举核对、四舍五入边界与 422 校验
+test_solver.py        # 求解器冒烟测试（含 3 路穷举对照，可直接 python3 运行）
+test_path_planner.py  # 路径规划冒烟测试（3 路位集动态规划穷举核对功率与字典序）
+test_calibration.py   # 标定四态、穷举核对、四舍五入边界与 422 校验
 ```
 
 ## 技术栈
