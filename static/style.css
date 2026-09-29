@@ -183,6 +183,34 @@ input[type="number"]:focus, input[type="text"]:focus {
 }
 #calib-residual-table { margin-top: 0; min-width: 480px; }
 
+/* 调光路径规划 */
+#path-start-table { min-width: 420px; max-width: 560px; }
+#path-start-table td input { width: 92px; }
+
+.path-param-row {
+  display: flex; gap: 26px; align-items: center;
+  flex-wrap: wrap; margin-top: 14px;
+}
+
+.path-timeline {
+  display: flex; align-items: stretch; gap: 10px;
+  flex-wrap: wrap; margin: 16px 0 6px;
+}
+.path-node {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 4px; min-width: 128px;
+}
+.path-node .swatch { width: 72px; height: 72px; }
+.path-node-title { font-weight: 600; font-size: 13px; }
+.path-node-meta {
+  font-size: 11.5px; color: var(--muted);
+  font-family: var(--mono); text-align: center; white-space: nowrap;
+}
+.path-timeline .swatch-arrow { align-self: center; }
+
+.delta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.delta.bad { color: var(--err); font-weight: 700; }
+
 .footer-note {
   color: var(--muted); font-size: 12px; padding-top: 4px; padding-bottom: 30px;
 }

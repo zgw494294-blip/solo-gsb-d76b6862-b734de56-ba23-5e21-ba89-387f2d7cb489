@@ -36,6 +36,10 @@ let manualMode = false;
 let calibSamples = [];
 // 最近一次唯一标定结果（{id:{r,g,b}} + 提交时的驱动级，供实测校验/写回）
 let calibUnique = null;
+// 调光路径：按通道 id 存起始驱动级（0～255），适应通道增删
+let pathStart = {};
+// 最近一次路径规划结果（服务端原样返回）
+let pathResult = null;
 
 /* ---------------- 工具 ---------------- */
 
@@ -82,6 +86,18 @@ function showBanner(kind, html) {
   el.innerHTML = html;
 }
 function clearBanner() { $('#error-banner').className = 'banner error hidden'; }
+
+// 把 422/500 响应的 detail 格式化为可展示的 HTML
+function errDetailHtml(data, fallback) {
+  const detail = data.detail;
+  if (Array.isArray(detail)) {
+    return detail.map((d) => {
+      const loc = (d.loc || []).filter((x) => x !== 'body').join('.');
+      return `${loc ? loc + '：' : ''}${d.msg}`;
+    }).join('<br>');
+  }
+  return esc(String(detail ?? fallback));
+}
 
 /* ---------------- 通道录入表 ---------------- */
 
@@ -200,17 +216,8 @@ async function onSolve() {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      const detail = data.detail;
-      let msg;
-      if (Array.isArray(detail)) {
-        msg = detail.map((d) => {
-          const loc = (d.loc || []).filter((x) => x !== 'body').join('.');
-          return `${loc ? loc + '：' : ''}${d.msg}`;
-        }).join('<br>');
-      } else {
-        msg = esc(String(detail ?? '求解失败'));
-      }
-      showBanner('error', '<strong>请求被拒绝：</strong><br>' + msg);
+      showBanner('error', '<strong>请求被拒绝：</strong><br>' +
+        errDetailHtml(data, '求解失败'));
       return;
     }
     renderSolution(data);
@@ -492,18 +499,9 @@ async function onCalibrate() {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      const detail = data.detail;
-      let msg;
-      if (Array.isArray(detail)) {
-        msg = detail.map((d) => {
-          const loc = (d.loc || []).filter((x) => x !== 'body').join('.');
-          return `${loc ? loc + '：' : ''}${d.msg}`;
-        }).join('<br>');
-      } else {
-        msg = esc(String(detail ?? '标定失败'));
-      }
       clearCalibResult();
-      showBanner('error', '<strong>请求被拒绝：</strong><br>' + msg);
+      showBanner('error', '<strong>请求被拒绝：</strong><br>' +
+        errDetailHtml(data, '标定失败'));
       return;
     }
     renderCalibResult(data, samples);
@@ -611,9 +609,252 @@ function onWriteback() {
   solution = null;
   optimalDrives = null;
   $('#result-panel').hidden = true;
+  renderPathStartTable();
+  clearPathResult();
   showBanner('info',
     `<strong>✔ 已写回 ${applied} 路满档 RGB</strong>，各路满档功率保持原值。` +
     `可直接在 ② 设置目标色后点击“求解最省功率配方”。`);
+}
+
+/* ---------------- 调光路径规划 ---------------- */
+
+// 通道增删/重命名后，把起始驱动级对齐到当前通道 id 集合
+function reconcilePathStart() {
+  const ids = new Set(channels.map((c) => c.id));
+  Object.keys(pathStart).forEach((id) => {
+    if (!ids.has(id)) delete pathStart[id];
+  });
+  channels.forEach((c) => {
+    if (pathStart[c.id] === undefined) pathStart[c.id] = 0;
+  });
+}
+
+function renderPathStartTable() {
+  reconcilePathStart();
+  $('#path-start-tbody').innerHTML = channels.map((c) => `
+    <tr data-id="${esc(c.id)}">
+      <td><strong>${esc(c.id)}</strong></td>
+      <td>${swatchHtml([c.r, c.g, c.b], `${c.id} 满档 RGB(${c.r}, ${c.g}, ${c.b})`)}</td>
+      <td><input type="number" class="f-pstart" min="0" max="255" step="1"
+           value="${pathStart[c.id] ?? 0}"></td>
+    </tr>`).join('');
+  refreshPathSwatches();
+}
+
+// 起点实际色：与后端相同的未裁剪公式 Σ(满档读数×起始驱动级)/255
+function startActualRgb() {
+  const s = [0, 0, 0];
+  channels.forEach((c) => {
+    const d = Math.max(0, Math.min(255, pathStart[c.id] ?? 0));
+    s[0] += c.r * d; s[1] += c.g * d; s[2] += c.b * d;
+  });
+  return s.map((v) => v / 255);
+}
+
+function refreshPathSwatches() {
+  const start = startActualRgb();
+  const shex = linearToSrgbHex(start);
+  const ssw = $('#path-start-swatch');
+  ssw.style.background = shex;
+  ssw.title = `起点实际线性 RGB(${start.map(fmt).join(', ')})` +
+    (start.some((v) => v > 1000) ? '（超出 0～1000，显示已裁剪，模型不裁剪）' : '');
+  $('#path-start-hex').textContent = shex.toUpperCase();
+  const tgt = [intVal($('#path-target-r')), intVal($('#path-target-g')), intVal($('#path-target-b'))];
+  const thex = linearToSrgbHex(tgt);
+  $('#path-target-swatch').style.background = thex;
+  $('#path-target-swatch').title = `终点线性 RGB(${tgt.join(', ')})`;
+  $('#path-target-hex').textContent = thex.toUpperCase();
+  $('#path-tol-echo').textContent = `±${intVal($('#tolerance'))}`;
+}
+
+function readPathForm() {
+  $$('#path-start-tbody tr').forEach((tr) => {
+    pathStart[tr.dataset.id] = intVal(tr.querySelector('.f-pstart'), 0);
+  });
+  return {
+    target: {
+      r: intVal($('#path-target-r')),
+      g: intVal($('#path-target-g')),
+      b: intVal($('#path-target-b')),
+    },
+    steps: intVal($('#path-steps')),
+    delta: intVal($('#path-delta')),
+    tolerance: intVal($('#tolerance')),
+  };
+}
+
+function validatePathForm(f) {
+  const errs = [];
+  if (!channels.every((c) => c.id)) errs.push('每路通道都必须填写 ID，才能规划路径。');
+  const ids = channels.map((c) => c.id);
+  if (new Set(ids).size !== ids.length) errs.push('通道 ID 必须唯一，才能规划路径。');
+  channels.forEach((c) => {
+    const d = pathStart[c.id];
+    if (!Number.isInteger(d) || d < 0 || d > 255)
+      errs.push(`通道 “${c.id}” 的起始驱动级必须是 0～255 的整数。`);
+  });
+  for (const k of ['r', 'g', 'b']) {
+    if (!Number.isInteger(f.target[k]) || f.target[k] < 0 || f.target[k] > 1000)
+      errs.push(`终点 ${k.toUpperCase()} 必须是 0～1000 的整数。`);
+  }
+  if (!Number.isInteger(f.steps) || f.steps < 2 || f.steps > 5)
+    errs.push('等时步骤数必须是 2～5 的整数。');
+  if (!Number.isInteger(f.delta) || f.delta < 1 || f.delta > 255)
+    errs.push('每步驱动变化上限必须是 1～255 的整数。');
+  if (f.tolerance < 0 || f.tolerance > 20)
+    errs.push('② 的共用容差必须是 0～20 的整数。');
+  return [...new Set(errs)];
+}
+
+function clearPathResult() {
+  pathResult = null;
+  $('#path-result').hidden = true;
+  $('#path-detail').hidden = true;
+  const st = $('#path-status');
+  st.className = 'calib-status';
+  st.textContent = '';
+}
+
+async function onSolvePath() {
+  clearBanner();
+  readForm(); // 先同步通道表与 ② 的容差
+  const f = readPathForm();
+  const errs = validatePathForm(f);
+  if (errs.length) {
+    clearPathResult();
+    showBanner('error', '<strong>路径参数有误，已拒绝提交：</strong><br>' +
+      errs.map(esc).join('<br>'));
+    return;
+  }
+  const btn = $('#path-solve-btn');
+  btn.disabled = true;
+  btn.textContent = '规划中…';
+  try {
+    const resp = await fetch('/api/path/solve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channels: channels.map(({ id, r, g, b, power_mw }) => ({ id, r, g, b, power_mw })),
+        start_drives: Object.fromEntries(channels.map((c) => [c.id, pathStart[c.id] ?? 0])),
+        target_r: f.target.r,
+        target_g: f.target.g,
+        target_b: f.target.b,
+        steps: f.steps,
+        max_step_delta: f.delta,
+        tolerance: f.tolerance,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      clearPathResult();
+      showBanner('error', '<strong>请求被拒绝：</strong><br>' +
+        errDetailHtml(data, '路径规划失败'));
+      return;
+    }
+    renderPathResult(data);
+  } catch (e) {
+    clearPathResult();
+    showBanner('error', `请求失败：${esc(e.message)}。请确认后端服务已启动。`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '规划最小功率调光路径';
+  }
+}
+
+function renderPathResult(data) {
+  pathResult = data;
+  $('#path-result').hidden = false;
+  const status = $('#path-status');
+  const MAP = {
+    optimal: ['s-unique', '✔ 最优完整路径'],
+    infeasible: ['s-contradictory', '⛔ 无完整路径'],
+    incomplete: ['s-unknown', '⏳ 搜索未完成'],
+  };
+  const [cls, label] = MAP[data.status] || ['s-unknown', data.status];
+  status.className = `calib-status ${cls}`;
+  status.innerHTML = `<strong>${label}</strong> ${esc(data.message)}`;
+
+  if (data.status !== 'optimal') {
+    // 无完整路径 / 搜索未完成：不展示任何步骤
+    $('#path-detail').hidden = true;
+    return;
+  }
+  $('#path-detail').hidden = false;
+  const tol = data.tolerance;
+  const K = data.steps.length;
+
+  // ---- 时间线：起点（第 0 步）→ 第 1 步 → … → 第 K 步 ----
+  const nodeHtml = (title, actual, ref, errs, power) => {
+    const lines = [
+      `<div class="path-node-meta">实际 (${actual.map(fmt).join(', ')})</div>`,
+    ];
+    if (ref) lines.push(`<div class="path-node-meta">参考 (${ref.map(fmt).join(', ')})</div>`);
+    if (errs) lines.push(`<div class="path-node-meta">误差 (${errs.map(fmtSigned).join(', ')})</div>`);
+    if (power != null) lines.push(`<div class="path-node-meta">功率 ${fmt(power)} mW</div>`);
+    return `<div class="path-node">
+      <div class="path-node-title">${esc(title)}</div>
+      <div class="swatch" style="background:${linearToSrgbHex(actual)}"
+           title="实际线性 RGB(${actual.map(fmt).join(', ')})"></div>
+      ${lines.join('')}
+    </div>`;
+  };
+  const nodes = [nodeHtml('起点（第 0 步）', data.start_actual_rgb, null, null, null)];
+  data.steps.forEach((st) => {
+    nodes.push(nodeHtml(
+      st.step === K ? `第 ${st.step} 步（终点）` : `第 ${st.step} 步`,
+      st.actual_rgb, st.ref_rgb, st.errors, st.power_mw));
+  });
+  $('#path-timeline').innerHTML = nodes.join('<div class="swatch-arrow">→</div>');
+
+  // ---- 驱动级矩阵：行 = 通道，列 = 时间 ----
+  $('#path-drive-head').innerHTML =
+    '<th>ID</th><th>起点</th>' +
+    data.steps.map((st) => `<th>第 ${st.step} 步</th>`).join('');
+  $('#path-drive-tbody').innerHTML = data.channel_ids.map((id, i) => {
+    const cells = [`<td><strong>${esc(id)}</strong></td>`];
+    let prev = data.start_drives[i];
+    cells.push(`<td>${prev}</td>`);
+    data.steps.forEach((st) => {
+      const d = st.drives[i];
+      const dd = d - prev;
+      const bad = Math.abs(dd) > data.max_step_delta;
+      cells.push(`<td>${d} <span class="delta${bad ? ' bad' : ''}">` +
+        `(Δ${dd >= 0 ? '+' : ''}${dd})</span></td>`);
+      prev = d;
+    });
+    return `<tr>${cells.join('')}</tr>`;
+  }).join('');
+
+  // ---- 分量对照：每步 3 行（R/G/B）----
+  $('#path-comp-head').innerHTML =
+    '<th>步骤</th><th>分量</th><th>下限</th><th>参考</th><th>上限</th>' +
+    '<th>实际</th><th>误差(实际−参考)</th><th>判定</th>';
+  const names = ['R', 'G', 'B'];
+  const ccls = ['r', 'g', 'b'];
+  const rows = [];
+  data.steps.forEach((st) => {
+    for (let c = 0; c < 3; c++) {
+      const lo = st.ref_rgb[c] - tol;
+      const hi = st.ref_rgb[c] + tol;
+      const ok = st.in_range[c];
+      rows.push(`<tr>
+        ${c === 0 ? `<td rowspan="3">第 ${st.step} 步</td>` : ''}
+        <td class="cname ${ccls[c]}">${names[c]}</td>
+        <td>${fmt(Math.max(0, lo))}</td>
+        <td>${fmt(st.ref_rgb[c])}</td>
+        <td>${fmt(Math.min(1000, hi))}</td>
+        <td>${fmt(st.actual_rgb[c])}</td>
+        <td>${fmtSigned(st.errors[c])}</td>
+        <td class="judge ${ok ? 'ok' : 'bad'}">${ok ? '✔ 在区间内' : '✘ 超差'}</td>
+      </tr>`);
+    }
+  });
+  $('#path-comp-tbody').innerHTML = rows.join('');
+
+  // ---- 各步功率之和 ----
+  $('#path-total-power').textContent = fmt(data.total_power_mw);
+  $('#path-power-frac').textContent =
+    `精确值 ${data.total_power_num} / 255 mW（${K} 步合计）`;
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -630,6 +871,8 @@ function bindEvents() {
     renderChannels();
     renderCalibTable();
     clearCalibResult();
+    renderPathStartTable();
+    clearPathResult();
   });
 
   $('#reset-sample').addEventListener('click', () => {
@@ -639,9 +882,18 @@ function bindEvents() {
     $('#target-b').value = SAMPLE.target.b;
     $('#tolerance').value = SAMPLE.tolerance;
     calibSamples = defaultCalibSamples();
+    // 路径参数一并恢复默认（起点全 0、终点同 ② 目标色、3 步、上限 40）
+    pathStart = {};
+    $('#path-target-r').value = SAMPLE.target.r;
+    $('#path-target-g').value = SAMPLE.target.g;
+    $('#path-target-b').value = SAMPLE.target.b;
+    $('#path-steps').value = 3;
+    $('#path-delta').value = 40;
     renderChannels();
     renderCalibTable();
     clearCalibResult();
+    renderPathStartTable();
+    clearPathResult();
     refreshTargetSwatch();
     clearBanner();
   });
@@ -649,6 +901,8 @@ function bindEvents() {
   $('#channel-tbody').addEventListener('input', (e) => {
     const tr = e.target.closest('tr');
     if (tr) syncRowState(tr);
+    renderPathStartTable();
+    clearPathResult();
   });
   $('#channel-tbody').addEventListener('click', (e) => {
     if (!e.target.classList.contains('del-btn')) return;
@@ -658,10 +912,17 @@ function bindEvents() {
     renderChannels();
     renderCalibTable();
     clearCalibResult();
+    renderPathStartTable();
+    clearPathResult();
   });
 
   ['#target-r', '#target-g', '#target-b', '#tolerance'].forEach((sel) =>
     $(sel).addEventListener('input', refreshTargetSwatch));
+  // 容差被路径规划沿用：变更后清除旧路径结果
+  $('#tolerance').addEventListener('input', () => {
+    refreshPathSwatches();
+    clearPathResult();
+  });
 
   $('#solve-btn').addEventListener('click', onSolve);
 
@@ -724,6 +985,29 @@ function bindEvents() {
 
   $('#calib-btn').addEventListener('click', onCalibrate);
   $('#writeback-btn').addEventListener('click', onWriteback);
+
+  // ---- 调光路径 ----
+  $('#path-start-tbody').addEventListener('input', (e) => {
+    if (!e.target.classList.contains('f-pstart')) return;
+    const tr = e.target.closest('tr');
+    if (tr) pathStart[tr.dataset.id] = intVal(e.target, 0);
+    refreshPathSwatches();
+    clearPathResult();
+  });
+  ['#path-target-r', '#path-target-g', '#path-target-b',
+   '#path-steps', '#path-delta'].forEach((sel) =>
+    $(sel).addEventListener('input', () => {
+      refreshPathSwatches();
+      clearPathResult();
+    }));
+  $('#path-use-target').addEventListener('click', () => {
+    $('#path-target-r').value = intVal($('#target-r'));
+    $('#path-target-g').value = intVal($('#target-g'));
+    $('#path-target-b').value = intVal($('#target-b'));
+    refreshPathSwatches();
+    clearPathResult();
+  });
+  $('#path-solve-btn').addEventListener('click', onSolvePath);
 }
 
 /* ---------------- 启动 ---------------- */
@@ -731,5 +1015,6 @@ function bindEvents() {
 calibSamples = defaultCalibSamples();
 renderChannels();
 renderCalibTable();
+renderPathStartTable();
 refreshTargetSwatch();
 bindEvents();

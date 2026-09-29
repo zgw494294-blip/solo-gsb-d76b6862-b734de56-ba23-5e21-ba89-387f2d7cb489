@@ -1,6 +1,7 @@
 # LED 混光配方台（本地）
 
-以 **OR-Tools CP-SAT** 精确求解多通道 LED 混光的**最小总功率**配方；
+以 **OR-Tools CP-SAT** 精确求解多通道 LED 混光的**最小总功率**配方，并可
+联合规划从起始驱动级到目标色的**最小总功率调光路径**；
 **Python / FastAPI** 提供接口，页面为**原生 HTML / CSS / JavaScript**（无前端框架、无构建步骤）。
 
 ## 一条命令启动
@@ -50,6 +51,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - “按当前通道生成示例样本”可依据当前通道表的满档值合成每路单独
      满档点亮的示例；非法样本（越界、数量不符、ID 问题等）前端与
      接口都会明确拒绝（HTTP 422）。
+5. **调光路径规划（⑤）**：以当前通道表为准，按 ID 录入各路 `0～255`
+   **起始驱动级**，再录入终点线性 RGB（`0～1000`）、等时步骤数（`2～5`）
+   与每步每路驱动变化上限（`1～255`），容差沿用 ② 的共用容差，点击
+   **“规划最小功率调光路径”**：
+   - 起点实际色按未裁剪公式计算；第 k 步参考色为起点实际色到终点按
+     `k/步骤数` 的线性插值（**不先取整**）；每步实际 RGB 须落在参考色
+     ± 容差且 `0～1000` 内，相邻两步（首步与起点）每路驱动变化不超过上限；
+   - 后端**联合**求解各步功率之和最小的**完整路径**，按时间轴展示起点与
+     各步的实际/参考色块、驱动级（含逐步 Δ）、分量误差与逐步功率；
+   - **无完整路径时不返回任何局部步骤；搜索未证明最优时报告“搜索未完成”**；
+   - 通道或任一路径参数（含 ② 的容差）变更后，旧路径结果自动清除。
 
 ## 数学模型
 
@@ -112,6 +124,38 @@ CP-SAT 两次求解给出**可证明**的三态结论（见 `app/calibration.py`
    超时 → **搜索未完成**。
 
 只有 `unique` 时页面才展示反求参数并允许写回。
+
+### 调光路径规划的整数模型
+
+给定各路起始驱动级 `start_i ∈ [0, 255]`、终点线性 RGB `target`、等时步骤数
+`K ∈ [2, 5]`、每步每路驱动变化上限 `Δ ∈ [1, 255]` 与共用容差 `tol`。
+决策变量为第 k 步（`k = 1..K`）各路驱动级 `d[k][i] ∈ [0, 255]` 整数。
+
+- 起点实际色（未裁剪公式，不取整）与第 k 步参考色（线性插值，**不先取整**）：
+
+  ```text
+  A0_c    = (Σ_i reading[i][c] · start_i) / 255 = S0_c / 255
+  ref_k_c = A0_c + (target_c − A0_c) · k / K
+  ```
+
+- 每步实际分量 `s_k_c / 255`（`s_k_c = Σ_i reading[i][c] · d[k][i]`，整数分子）
+  须落在参考色 ± 容差且 `0～1000` 内。窗口约束两边同乘 `255·K` 后完全整数化：
+
+  ```text
+  |K·s_k_c − T_k_c| ≤ 255·K·tol,   T_k_c = (K−k)·S0_c + 255·k·target_c
+  0 ≤ s_k_c ≤ 255·1000
+  ```
+
+- 爬坡约束（首步相对起点）：`|d[k][i] − d[k−1][i]| ≤ Δ`，`d[0][i] = start_i`。
+- 目标：最小化各步功率之和的整数分子 `Σ_k Σ_i power_i · d[k][i]`
+  （实际 mW = 该值 / 255）。
+
+求解前先做 K 次**预求解**：第 k 步无视爬坡约束时的最小功率 `lb_k`
+（规模与单步配方求解相同），作为主模型中该步功率变量的下界以加速最优性
+证明；若某步窗口本身不可行，则整条路径必然不可行，可直接判定。
+结论三态（见 `app/path_solver.py`）：`optimal` 返回已证明总功率最小的完整
+路径；`infeasible` 无完整路径；`incomplete` 搜索未证明最优——后两者都
+**不返回任何步骤**。
 
 ## API
 
@@ -180,6 +224,43 @@ curl -s http://localhost:8000/api/calibrate -H 'Content-Type: application/json' 
 通道数非 3～6、ID 为空/重复、样本数非 3～12、驱动级非 `0～255` 整数、
 实测非 3 个 `0～6000` 整数、驱动级数量与通道数不符等，一律 HTTP 422。
 
+### `POST /api/path/solve`
+
+联合求解从起始驱动级到终点色的等时调光路径（各步功率之和最小）。
+`start_drives` 按通道 ID 给出，须与 `channels` 一一对应：
+
+```bash
+curl -s http://localhost:8000/api/path/solve -H 'Content-Type: application/json' -d '{
+  "channels": [
+    {"id": "R", "r": 1000, "g": 120, "b": 40,  "power_mw": 3200},
+    {"id": "G", "r": 160,  "g": 1000, "b": 90, "power_mw": 2800},
+    {"id": "B", "r": 60,   "g": 80,  "b": 1000, "power_mw": 3400},
+    {"id": "W", "r": 820,  "g": 800, "b": 760, "power_mw": 6500}
+  ],
+  "start_drives": {"R": 0, "G": 0, "B": 0, "W": 0},
+  "target_r": 600, "target_g": 420, "target_b": 180,
+  "steps": 3,
+  "max_step_delta": 40,
+  "tolerance": 12
+}'
+```
+
+`status` 三态：
+
+| status       | 含义                                       | `steps` |
+| ------------ | ------------------------------------------ | ------- |
+| `optimal`    | 已证明各步功率之和最小的完整路径           | 有值    |
+| `infeasible` | 不存在满足全部约束的完整路径               | 空      |
+| `incomplete` | 搜索未证明最优，**不返回任何路径**         | 空      |
+
+`optimal` 时响应主要字段：`channel_ids` 与 `start_drives`、
+`start_actual_rgb`（起点实际色，未裁剪公式）、`steps[]`（按时间顺序，
+含 `drives`（与 `channel_ids` 同序）、`actual_rgb`、`ref_rgb`（未取整的
+插值参考色）、`errors`（实际 − 参考）、`in_range`、`power_mw`/`power_num`）、
+`total_power_mw`/`total_power_num`（各步功率之和，实际功率 =
+`total_power_num / 255`）。起始驱动级越界/缺漏/多余、步骤数非 2～5、
+变化上限非 1～255、终点非 `0～1000`、容差非 `0～20` 等一律 HTTP 422。
+
 ## 显示说明
 
 色块按**标准 sRGB 传递函数**显示：线性分量先除以 1000 归一化，再按
@@ -191,19 +272,21 @@ curl -s http://localhost:8000/api/calibrate -H 'Content-Type: application/json' 
 
 ```text
 app/
-  main.py        # FastAPI 应用与 /api/solve、/api/calibrate、静态页面挂载
+  main.py        # FastAPI 应用与 /api/solve、/api/calibrate、/api/path/solve、静态页面挂载
   solver.py      # CP-SAT 两阶段精确求解（配方）
   calibration.py # CP-SAT 满档读数反求（唯一/矛盾/不唯一/搜索未完成 四态）
+  path_solver.py # CP-SAT 调光路径联合求解（最优/无完整路径/搜索未完成 三态）
   schemas.py     # 请求/响应模型与录入校验
 static/
   index.html   # 页面结构
   style.css    # 样式
-  app.js       # 通道编辑、标定样本、求解调用、色块/误差/功率计算与手动预览
+  app.js       # 通道编辑、标定样本、求解与路径规划调用、色块/误差/功率计算与手动预览
 Dockerfile
 docker-compose.yml
 requirements.txt
 test_solver.py       # 求解器冒烟测试（含 3 路穷举对照，可直接 python3 运行）
 test_calibration.py  # 标定四态、穷举核对、四舍五入边界与 422 校验
+test_path.py         # 调光路径三态、穷举+动态规划最优性核对与 422 校验
 ```
 
 ## 技术栈

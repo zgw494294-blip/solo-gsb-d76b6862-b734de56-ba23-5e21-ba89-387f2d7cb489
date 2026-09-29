@@ -13,10 +13,14 @@ from .schemas import (
     CalibrateResponse,
     CalibChannelResult,
     ChannelSolution,
+    PathSolveRequest,
+    PathSolveResponse,
+    PathStepSolution,
     SolveRequest,
     SolveResponse,
 )
 from .calibration import CalibSample, calibrate
+from .path_solver import solve_path
 from .solver import Channel, solve, SolverError
 
 # static/ 与 app/ 同级；用绝对路径，保证从任意工作目录启动都能找到页面
@@ -110,6 +114,49 @@ def api_calibrate(req: CalibrateRequest) -> CalibrateResponse:
             for (cid, r, g, b) in result.channels
         ],
         message=result.message,
+    )
+
+
+@app.post("/api/path/solve", response_model=PathSolveResponse)
+def api_solve_path(req: PathSolveRequest) -> PathSolveResponse:
+    """规划从起始驱动级到目标色的等时调光路径（各步功率之和最小）。
+
+    三态结论：optimal 返回完整路径；infeasible / incomplete 不返回任何步骤。
+    """
+    channels = [
+        Channel(id=c.id, rgb=(c.r, c.g, c.b), power_mw=c.power_mw)
+        for c in req.channels
+    ]
+    start = [req.start_drives[c.id] for c in req.channels]
+    target = (req.target_r, req.target_g, req.target_b)
+    res = solve_path(
+        channels, start, target, req.steps, req.max_step_delta, req.tolerance
+    )
+    return PathSolveResponse(
+        status=res.status,
+        channel_ids=[c.id for c in req.channels],
+        start_drives=res.start_drives,
+        start_actual_rgb=res.start_actual_rgb,
+        target=list(target),
+        tolerance=req.tolerance,
+        max_step_delta=req.max_step_delta,
+        step_count=req.steps,
+        steps=[
+            PathStepSolution(
+                step=k + 1,
+                drives=st.drives,
+                actual_rgb=st.actual_rgb,
+                ref_rgb=st.ref_rgb,
+                errors=st.errors,
+                in_range=st.in_range,
+                power_mw=st.power_mw,
+                power_num=st.power_num,
+            )
+            for k, st in enumerate(res.steps)
+        ],
+        total_power_mw=res.total_power_mw,
+        total_power_num=res.total_power_num,
+        message=res.message,
     )
 
 

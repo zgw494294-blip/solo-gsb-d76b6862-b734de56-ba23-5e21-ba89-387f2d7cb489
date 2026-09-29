@@ -151,3 +151,85 @@ class CalibrateResponse(BaseModel):
     status: Literal["unique", "contradictory", "non_unique", "unknown"]
     channels: list[CalibChannelResult] = []
     message: str = ""
+
+
+# ---------------- 调光路径规划 ----------------
+
+
+class PathSolveRequest(BaseModel):
+    channels: list[ChannelInput] = Field(..., description="3～6 路 LED，ID 唯一")
+    start_drives: dict[str, int] = Field(
+        ..., description="按通道 ID 的起始驱动级，每个 0～255，须与通道一一对应"
+    )
+    target_r: int = Field(..., ge=0, le=1000, description="终点线性 R")
+    target_g: int = Field(..., ge=0, le=1000, description="终点线性 G")
+    target_b: int = Field(..., ge=0, le=1000, description="终点线性 B")
+    steps: int = Field(..., ge=2, le=5, description="等时步骤数 2～5")
+    max_step_delta: int = Field(
+        ..., ge=1, le=255, description="每步每路驱动变化上限 1～255"
+    )
+    tolerance: int = Field(..., ge=0, le=20, description="共用整数容差")
+
+    @field_validator("start_drives")
+    @classmethod
+    def _check_start_drives(cls, v: dict[str, int]) -> dict[str, int]:
+        for cid, d in v.items():
+            if not isinstance(d, int) or not 0 <= d <= 255:
+                raise ValueError(f"通道 “{cid}” 的起始驱动级必须是 0～255 的整数")
+        return v
+
+    @model_validator(mode="after")
+    def _check_channels(self) -> "PathSolveRequest":
+        if not 3 <= len(self.channels) <= 6:
+            raise ValueError("LED 通道数必须为 3～6 路")
+        ids = [c.id for c in self.channels]
+        if len(set(ids)) != len(ids):
+            dup = sorted({x for x in ids if ids.count(x) > 1})
+            raise ValueError(f"通道 ID 必须唯一，重复 ID：{', '.join(dup)}")
+        missing = [cid for cid in ids if cid not in self.start_drives]
+        if missing:
+            raise ValueError(
+                f"缺少以下通道的起始驱动级：{', '.join(missing)}"
+            )
+        extra = sorted(k for k in self.start_drives if k not in set(ids))
+        if extra:
+            raise ValueError(
+                f"起始驱动级包含未知通道 ID：{', '.join(extra)}"
+            )
+        return self
+
+
+class PathStepSolution(BaseModel):
+    step: int = Field(..., description="步骤序号（1 起始）")
+    drives: list[int] = Field(..., description="各路驱动级，与 channel_ids 同序")
+    actual_rgb: list[float]
+    ref_rgb: list[float] = Field(..., description="未取整的插值参考色")
+    errors: list[float] = Field(..., description="实际 − 参考")
+    in_range: list[bool]
+    power_mw: float
+    power_num: int = Field(
+        ..., description="该步功率的整数分子，实际功率 = 该值 / 255"
+    )
+
+
+class PathSolveResponse(BaseModel):
+    # optimal：已证明总功率最小的完整路径（steps 有值）；
+    # infeasible：无完整路径；incomplete：搜索未证明最优（均不返回任何步骤）
+    status: Literal["optimal", "infeasible", "incomplete"]
+    channel_ids: list[str] = []
+    start_drives: list[int] = Field(
+        default=[], description="起点（第 0 步）驱动级，与 channel_ids 同序"
+    )
+    start_actual_rgb: list[float] = Field(
+        default=[], description="起点实际色（未裁剪公式，不取整）"
+    )
+    target: list[int] = []
+    tolerance: int = 0
+    max_step_delta: int = 0
+    step_count: int = 0
+    steps: list[PathStepSolution] = []
+    total_power_mw: float | None = None
+    total_power_num: int | None = Field(
+        default=None, description="各步功率之和的整数分子，实际功率 = 该值 / 255"
+    )
+    message: str = ""
